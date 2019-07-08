@@ -1,4 +1,11 @@
 <?php
+/**
+ * WooCommerce.com Product Installation.
+ *
+ * @class    WC_Helper_Product_Install
+ * @package  WooCommerce/Admin
+ */
+
 if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
@@ -26,12 +33,13 @@ class WC_Helper_Product_Install {
 	 * @var array
 	 */
 	private static $default_step_state = array(
-		'download_link' => '',
-		'product_type'  => '',
-		'last_step'     => '',
-		'last_error'    => '',
-		'download_path' => '',
-		'unpacked_path' => '',
+		'download_link'  => '',
+		'product_type'   => '',
+		'last_step'      => '',
+		'last_error'     => '',
+		'download_path'  => '',
+		'unpacked_path'  => '',
+		'installed_path' => '',
 	);
 
 	/**
@@ -79,7 +87,7 @@ class WC_Helper_Product_Install {
 	}
 
 	/**
-	 * Reset product isntall state.
+	 * Reset product install state.
 	 */
 	public static function reset_state() {
 		WC_Helper_Options::update( 'product_install', self::$default_state );
@@ -105,7 +113,6 @@ class WC_Helper_Product_Install {
 		self::update_state( 'steps', $steps );
 
 		// TODO: async install? i.e. queue the job via Action Scheduler.
-
 		require_once( ABSPATH . 'wp-admin/includes/file.php' );
 		require_once( ABSPATH . 'wp-admin/includes/plugin-install.php' );
 		require_once( ABSPATH . 'wp-admin/includes/class-wp-upgrader.php' );
@@ -181,10 +188,13 @@ class WC_Helper_Product_Install {
 
 		$state_steps[ $product_id ]['last_step'] = $step;
 
-		self::update_state( 'current_step', array(
-			'product_id' => $product_id,
-			'step'       => $step,
-		) );
+		self::update_state(
+			'current_step',
+			array(
+				'product_id' => $product_id,
+				'step'       => $step,
+			)
+		);
 
 		$result = call_user_func( array( __CLASS__, $step ), $product_id, $upgrader );
 		if ( is_wp_error( $result ) ) {
@@ -201,6 +211,9 @@ class WC_Helper_Product_Install {
 				case 'unpack_product':
 					$state_steps[ $product_id ]['unpacked_path'] = $result;
 					break;
+				case 'move_product':
+					$state_steps[ $product_id ]['installed_path'] = $result['destination'];
+					break;
 			}
 		}
 
@@ -212,7 +225,7 @@ class WC_Helper_Product_Install {
 	 *
 	 * @param int $product_id Product ID.
 	 *
-	 * @return \WP_Error|string
+	 * @return bool|\WP_Error
 	 */
 	private static function get_product_info( $product_id ) {
 		$product_info = array(
@@ -279,6 +292,8 @@ class WC_Helper_Product_Install {
 	 *
 	 * @param int          $product_id Product ID.
 	 * @param \WP_Upgrader $upgrader   Core class to handle installation.
+	 *
+	 * @return \WP_Error|string
 	 */
 	private static function unpack_product( $product_id, $upgrader ) {
 		$steps = self::get_state( 'steps' );
@@ -287,7 +302,6 @@ class WC_Helper_Product_Install {
 		}
 
 		return $upgrader->unpack_package( $steps[ $product_id ]['download_path'], true );
-
 	}
 
 	/**
@@ -295,6 +309,8 @@ class WC_Helper_Product_Install {
 	 *
 	 * @param int          $product_id Product ID.
 	 * @param \WP_Upgrader $upgrader   Core class to handle installation.
+	 *
+	 * @return array|\WP_Error
 	 */
 	private static function move_product( $product_id, $upgrader ) {
 		$steps = self::get_state( 'steps' );
@@ -303,44 +319,104 @@ class WC_Helper_Product_Install {
 		}
 
 		// TODO: handle theme.
-
-		return $upgrader->install_package( array(
-			'source'        => $steps[ $product_id ]['unpacked_path'],
-			'destination'   => WP_PLUGIN_DIR,
-			'clear_working' => true,
-			'hook_extra'    => array(
-				'type'   => 'plugin',
-				'action' => 'install',
+		return $upgrader->install_package(
+			array(
+				'source'        => $steps[ $product_id ]['unpacked_path'],
+				'destination'   => WP_PLUGIN_DIR,
+				'clear_working' => true,
+				'hook_extra'    => array(
+					'type'   => 'plugin',
+					'action' => 'install',
+				),
 			)
-		) );
+		);
 	}
 
 	/**
 	 * Activate product given its product ID.
 	 *
 	 * @param int $product_id Product ID.
+	 *
+	 * @return \WP_Error|null
 	 */
 	private static function activate_product( $product_id ) {
 		// Clear plugins cache used in `WC_Helper::get_local_woo_plugins`.
 		wp_clean_plugins_cache();
+		$filename = false;
 
-		$plugins = wp_list_filter(
-			WC_Helper::get_local_woo_plugins(),
-			array(
-				'_product_id' => $product_id,
-			)
-		);
+		// If product is WP.org one, find out its filename.
+		$dir_name = self::get_wporg_product_dir_name( $product_id );
+		if ( false !== $dir_name ) {
+			$filename = self::get_wporg_plugin_main_file( $dir_name );
+		}
 
-		$filename = is_array( $plugins ) && ! empty( $plugins )
-			? key( $plugins )
-			: '';
+		if ( false === $filename ) {
+			$plugins = wp_list_filter(
+				WC_Helper::get_local_woo_plugins(),
+				array(
+					'_product_id' => $product_id,
+				)
+			);
+
+			$filename = is_array( $plugins ) && ! empty( $plugins )
+				? key( $plugins )
+				: '';
+		}
 
 		if ( empty( $filename ) ) {
 			return new WP_Error( 'unknown_filename', __( 'Unknown product filename.', 'woocommerce' ) );
 		}
 
-		// TODO: theme activation support
-
+		// TODO: theme activation support.
 		return activate_plugin( $filename );
+	}
+
+	/**
+	 * Get WP.org product filename.
+	 *
+	 * @param int $product_id Product ID.
+	 *
+	 * @return bool|string
+	 */
+	private static function get_wporg_product_dir_name( $product_id ) {
+		$steps = self::get_state( 'steps' );
+		$product = $steps[ $product_id ];
+
+		if ( empty( $product['download_url'] ) || empty( $product['installed_path'] ) ) {
+			return false;
+		}
+
+		// Check whether product was downloaded from WordPress.org.
+		$host = parse_url( $product['download_url'], PHP_URL_HOST );
+		if ( 'downloads.wordpress.org' !== $host ) {
+			return false;
+		}
+
+		return basename( $product['installed_path'] );
+	}
+
+	/**
+	 * Get plugin's relative path.
+	 *
+	 * @param string $folder Folder of the plugin.
+	 *
+	 * @return bool|string
+	 */
+	private static function get_wporg_plugin_main_file( $folder ) {
+		// Ensure that exact folder name is used.
+		$folder .= '/';
+
+		if ( ! function_exists( 'get_plugins' ) ) {
+			require_once ABSPATH . 'wp-admin/includes/plugin.php';
+		}
+
+		$plugins = get_plugins();
+		foreach ( $plugins as $path => $plugin ) {
+			if ( 0 === strpos( $path, $folder ) ) {
+				return $path;
+			}
+		}
+
+		return false;
 	}
 }
